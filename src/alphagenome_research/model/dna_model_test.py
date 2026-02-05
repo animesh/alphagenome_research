@@ -116,6 +116,10 @@ class DnaModelTest(parameterized.TestCase):
             'ontology_curie': ['UBERON:0000001', 'UBERON:0000002'],
             'strand': '.',
         }),
+        splice_sites=pd.DataFrame({
+            'name': ['donor', 'acceptor', 'donor', 'acceptor', 'padding'],
+            'strand': ['+', '+', '-', '-', '.'],
+        }),
         splice_junctions=pd.DataFrame({
             'name': (
                 [f'tissue_{i}' for i in range(self._num_tissues)]
@@ -638,10 +642,15 @@ class DnaModelTest(parameterized.TestCase):
     for expected, scores in zip(expected_variants, scores, strict=True):
       self.assertEqual(expected, scores[0].uns['variant'])
 
-  @mock.patch.object(jax, 'eval_shape', return_value=MOCK_SHAPES, autospec=True)
-  def test_create(self, mock_eval_shape):
-    del mock_eval_shape
-    params, state = {}, {}
+  def test_create(self):
+    init_fn, _, _ = dna_model.create_model(
+        {dna_model.Organism.HOMO_SAPIENS: self._metadata}
+    )
+    params, state = jax.jit(init_fn)(
+        jax.random.PRNGKey(0),
+        jax.ShapeDtypeStruct((1, 2048, 4), dtype=jnp.float32),
+        jax.ShapeDtypeStruct((1,), dtype=jnp.int32),
+    )
     checkpointer = ocp.StandardCheckpointer()
     checkpoint_dir = os.path.join(self.create_tempdir().full_path, 'ckpt')
     checkpointer.save(checkpoint_dir, (params, state))
@@ -670,6 +679,7 @@ class DnaModelTest(parameterized.TestCase):
                 pas_feather_path=polya_gtf_path,
                 splice_site_starts_feather_path=splice_starts_path,
                 splice_site_ends_feather_path=splice_ends_path,
+                metadata=self._metadata,
             )
         },
         device=jax.local_devices()[0],

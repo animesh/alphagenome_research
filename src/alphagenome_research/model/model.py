@@ -31,6 +31,10 @@ import jax
 from jaxtyping import Array, Float, Int, PyTree  # pylint: disable=g-importing-member, g-multiple-import
 
 
+DEFAULT_NUM_SPLICE_SITES = 512
+DEFAULT_SPLICE_SITE_THRESHOLD = 0.1
+
+
 class SequenceEncoder(hk.Module):
   """Encodes a sequence of DNA into embeddings."""
 
@@ -94,8 +98,8 @@ class AlphaGenome(hk.Module):
           dna_model.Organism, metadata_lib.AlphaGenomeOutputMetadata
       ],
       *,
-      num_splice_sites: int = 512,
-      splice_site_threshold: float = 0.1,
+      num_splice_sites: int = DEFAULT_NUM_SPLICE_SITES,
+      splice_site_threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
       freeze_trunk_embeddings: bool = False,
       name: str | None = None,
   ):

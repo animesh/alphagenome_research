@@ -54,7 +54,7 @@ import haiku as hk
 import huggingface_hub
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Float32, Int32, PyTree  # pylint: disable=g-importing-member, g-multiple-import
+from jaxtyping import Array, Bool, Float, Float32, Int32, PyTree, Shaped  # pylint: disable=g-importing-member, g-multiple-import
 import jmp
 import kagglehub
 from kagglehub import auth as kaggle_auth
@@ -63,6 +63,7 @@ import orbax.checkpoint as ocp
 import pandas as pd
 
 
+AlphaGenomeOutputMetadata: TypeAlias = metadata_lib.AlphaGenomeOutputMetadata
 ModelVersion: TypeAlias = dna_model.ModelVersion
 Organism: TypeAlias = dna_model.Organism
 Output: TypeAlias = dna_output.Output
@@ -325,9 +326,7 @@ class AlphaGenomeModel(dna_model.DnaModel):
       state: hk.State,
       apply_fn: ApplyFn,
       junctions_apply_fn: JunctionsApplyFn,
-      metadata: Mapping[
-          dna_model.Organism, metadata_lib.AlphaGenomeOutputMetadata
-      ],
+      metadata: Mapping[dna_model.Organism, AlphaGenomeOutputMetadata],
       fasta_extractors: (
           Mapping[dna_model.Organism, fasta.FastaExtractor] | None
       ) = None,
@@ -921,7 +920,7 @@ def _construct_output_from_predictions(
     ],
     *,
     track_masks: Mapping[dna_output.OutputType, Bool[np.ndarray, '_']],
-    metadata: metadata_lib.AlphaGenomeOutputMetadata,
+    metadata: AlphaGenomeOutputMetadata,
     interval: genome.Interval | None = None,
 ) -> dna_output.Output:
   """Returns a dna_output.Output from model predictions with data on CPU."""
@@ -1018,7 +1017,7 @@ class OrganismSettings:
 
   # Optional output metadata. If None, we load the default AlphaGenome metadata
   # for the organism.
-  metadata: metadata_lib.AlphaGenomeOutputMetadata | None = None
+  metadata: AlphaGenomeOutputMetadata | None = None
 
   # Optional paths to the reference genome and annotation data. If None,
   # functions that accept intervals or variants will fail.
@@ -1087,6 +1086,96 @@ def default_organism_settings() -> (
   }
 
 
+@typing.jaxtyped
+def create_model(
+    metadata: Mapping[dna_model.Organism, AlphaGenomeOutputMetadata],
+    *,
+    num_splice_sites: int = model.DEFAULT_NUM_SPLICE_SITES,
+    splice_site_threshold: float = model.DEFAULT_SPLICE_SITE_THRESHOLD,
+) -> tuple[
+    Callable[
+        [chex.PRNGKey, Float[Array, 'B S 4'], Int32[Array, 'B']],
+        tuple[hk.Params, hk.State],
+    ],
+    Callable[
+        [hk.Params, hk.State, Float[Array, 'B S 4'], Int32[Array, 'B']],
+        PyTree[Shaped[Array, 'B ...'] | None],
+    ],
+    Callable[
+        [
+            hk.Params,
+            hk.State,
+            Float[Array, 'B S D'],
+            Int32[Array, 'B 4 K'],
+            Int32[Array, 'B'],
+        ],
+        PyTree[Shaped[Array, 'B ...'] | None],
+    ],
+]:
+  """Helper to create AlphaGenome init and two apply functions."""
+
+  jmp_policy = jmp.get_policy('params=float32,compute=bfloat16,output=bfloat16')
+
+  @hk.transform_with_state
+  def _forward(
+      dna_sequence: Float[Array, 'B S 4'],
+      organism_index: Int32[Array, 'B'],
+  ):
+    """AlphaGenome default forward pass."""
+    with hk.mixed_precision.push_policy(model.AlphaGenome, jmp_policy):
+      return model.AlphaGenome(
+          metadata,
+          num_splice_sites=num_splice_sites,
+          splice_site_threshold=splice_site_threshold,
+      )(dna_sequence, organism_index)
+
+  def _apply_fn(
+      params: hk.Params,
+      state: hk.State,
+      dna_sequence: Float[Array, 'B S 4'],
+      organism_index: Int32[Array, 'B'],
+  ) -> PyTree[Shaped[Array, 'B ...']]:
+    """AlphaGenome default apply function."""
+    (predictions, _), _ = _forward.apply(
+        params, state, None, dna_sequence, organism_index
+    )
+    return predictions
+
+  def _junctions_apply_fn(
+      params: hk.Params,
+      state: hk.State,
+      trunk_embeddings: Float[Array, 'B S D'],
+      splice_site_positions: Int32[Array, 'B 4 K'],
+      organism_index: Int32[Array, 'B'],
+  ):
+    """AlphaGenome junctions apply function."""
+
+    @hk.transform_with_state
+    def _forward_junctions(
+        trunk_embeddings, splice_site_positions, organism_index
+    ):
+      with hk.mixed_precision.push_policy(model.AlphaGenome, jmp_policy):
+        return model.AlphaGenome(
+            metadata,
+            num_splice_sites=num_splice_sites,
+            splice_site_threshold=splice_site_threshold,
+        ).predict_junctions(
+            trunk_embeddings, splice_site_positions, organism_index
+        )
+
+    (predictions, _), _ = _forward_junctions.apply(
+        params,
+        state,
+        None,
+        trunk_embeddings,
+        splice_site_positions,
+        organism_index,
+    )
+    return predictions
+
+  return _forward.init, _apply_fn, _junctions_apply_fn
+
+
 def create(
     checkpoint_path: str | os.PathLike[str],
     *,
@@ -1141,64 +1230,27 @@ def create(
           )
       )
 
-  jmp_policy = jmp.get_policy('params=float32,compute=bfloat16,output=bfloat16')
+  init_fn, apply_fn, junctions_apply_fn = create_model(
+      metadata,
+      num_splice_sites=model_settings.num_splice_sites,
+      splice_site_threshold=model_settings.splice_site_threshold,
+  )
 
-  @hk.transform_with_state
-  def _forward(dna_sequence, organism_index):
-    with hk.mixed_precision.push_policy(model.AlphaGenome, jmp_policy):
-      return model.AlphaGenome(
-          metadata,
-          num_splice_sites=model_settings.num_splice_sites,
-          splice_site_threshold=model_settings.splice_site_threshold,
-      )(dna_sequence, organism_index)
-
-  def _apply_fn(params, state, dna_sequence, organism_index):
-    (predictions, _), _ = _forward.apply(
-        params, state, None, dna_sequence, organism_index
-    )
-    return predictions
-
-  @hk.transform_with_state
-  def _forward_junctions(
-      trunk_embeddings, splice_site_positions, organism_index
-  ):
-    with hk.mixed_precision.push_policy(model.AlphaGenome, jmp_policy):
-      return model.AlphaGenome(
-          metadata,
-          num_splice_sites=model_settings.num_splice_sites,
-          splice_site_threshold=model_settings.splice_site_threshold,
-      ).predict_junctions(
-          trunk_embeddings, splice_site_positions, organism_index
-      )
-
-  def _apply_fn_junctions(
-      params, state, trunk_embeddings, splice_site_positions, organism_index
-  ):
-    predictions, _ = _forward_junctions.apply(
-        params,
-        state,
-        None,
-        trunk_embeddings,
-        splice_site_positions,
-        organism_index,
-    )
-    return predictions
-
-  seq_init = jax.ShapeDtypeStruct((1, 2048, 4), dtype=jnp.float32)
-  tax_id_init = jax.ShapeDtypeStruct((1,), dtype=jnp.int32)
-  params_shape, state_shape = jax.eval_shape(
-      _forward.init, jax.random.PRNGKey(0), seq_init, tax_id_init
+  dna_sequence_shape = jax.ShapeDtypeStruct((1, 2048, 4), dtype=jnp.float32)
+  organism_index_shape = jax.ShapeDtypeStruct((1,), dtype=jnp.int32)
+  params_shapes, state_shapes = jax.eval_shape(
+      init_fn, jax.random.PRNGKey(0), dna_sequence_shape, organism_index_shape
   )
   checkpointer = ocp.StandardCheckpointer()
   params, state = checkpointer.restore(
-      checkpoint_path, target=(params_shape, state_shape), strict=True
+      checkpoint_path, target=(params_shapes, state_shapes), strict=True
   )
 
   return AlphaGenomeModel(
       params=params,
       state=state,
-      apply_fn=_apply_fn,
-      junctions_apply_fn=_apply_fn_junctions,
+      apply_fn=apply_fn,
+      junctions_apply_fn=junctions_apply_fn,
       metadata=metadata,
       fasta_extractors=fasta_extractors,
       splice_site_extractors=splice_site_extractors,
@@ -1214,7 +1266,7 @@ def create_from_kaggle(
     model_version: str | ModelVersion,
     *,
     organism_settings: (
-        Mapping[dna_model.Organism, OrganismSettings] | None
+        Mapping[dna_model.Organism, AlphaGenomeOutputMetadata] | None
     ) = None,
     device: jax.Device | None = None,
 ) -> AlphaGenomeModel:
@@ -1248,7 +1300,7 @@ def create_from_huggingface(
     model_version: str | ModelVersion,
     *,
     organism_settings: (
-        Mapping[dna_model.Organism, OrganismSettings] | None
+        Mapping[dna_model.Organism, AlphaGenomeOutputMetadata] | None
     ) = None,
     device: jax.Device | None = None,
 ) -> AlphaGenomeModel:
