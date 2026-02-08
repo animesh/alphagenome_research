@@ -1136,9 +1136,14 @@ def create_model(
       organism_index: Int32[Array, 'B'],
   ) -> PyTree[Shaped[Array, 'B ...']]:
     """AlphaGenome default apply function."""
-    (predictions, _), _ = _forward.apply(
-        params, state, None, dna_sequence, organism_index
-    )
+    result = _forward.apply(params, state, None, dna_sequence, organism_index)
+    # `result` may have different nesting across haiku/jax versions, e.g.
+    # ((predictions, aux), new_state) or (predictions, new_state).
+    preds_part = result[0]
+    if isinstance(preds_part, (tuple, list)):
+      predictions = preds_part[0]
+    else:
+      predictions = preds_part
     return predictions
 
   def _junctions_apply_fn(
@@ -1163,7 +1168,7 @@ def create_model(
             trunk_embeddings, splice_site_positions, organism_index
         )
 
-    (predictions, _), _ = _forward_junctions.apply(
+    result = _forward_junctions.apply(
         params,
         state,
         None,
@@ -1171,6 +1176,11 @@ def create_model(
         splice_site_positions,
         organism_index,
     )
+    preds_part = result[0]
+    if isinstance(preds_part, (tuple, list)):
+      predictions = preds_part[0]
+    else:
+      predictions = preds_part
     return predictions
 
   return _forward.init, _apply_fn, _junctions_apply_fn
